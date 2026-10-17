@@ -43,15 +43,21 @@ jobs:
           RUNNER_IP=$(/opt/homebrew/bin/tailscale ip -4 | head -n1)
           echo "TAILSCALE_IP=$RUNNER_IP" >> $GITHUB_ENV
 
-      - name: Setup System User & SSH
+      - name: Create Dedicated Admin User & SSH
         env:
           USER_PASS: ${{ github.event.inputs.vnc_password }}
         run: |
-          # Set password akun user macOS via Directory Service (dscl)
-          sudo dscl . -passwd /Users/runner "${USER_PASS}"
+          set -e
+          # 1. Buat admin user baru 'macuser' (tidak memerlukan password lama)
+          sudo sysadminctl -addUser macuser -fullName "Mac Admin" -password "${USER_PASS}" -admin
           
-          # Aktifkan layanan Remote Login (SSH)
-          sudo systemsetup -setremotelogin on || true
+          # 2. Berikan hak sudo NOPASSWD untuk macuser
+          echo "macuser ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/macuser
+          
+          # 3. Aktifkan service Remote Login SSH
+          sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null || true
+          sudo systemsetup -setremotelogin on 2>/dev/null || true
+          sudo dseditgroup -o edit -a macuser -t user com.apple.access_ssh 2>/dev/null || true
           sudo dseditgroup -o edit -a runner -t user com.apple.access_ssh 2>/dev/null || true
 
       - name: Setup Screen Sharing (VNC)
@@ -59,13 +65,18 @@ jobs:
           VNC_PASS: ${{ github.event.inputs.vnc_password }}
         run: |
           set -e
+          # Aktifkan daemon Screen Sharing
           sudo launchctl enable system/com.apple.screensharing 2>/dev/null || true
           sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
           
+          # Konfigurasi ARDAgent untuk mengizinkan semua admin user
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
             -activate -configure -access -on \
-            -restart -agent -privs -all
+            -allowAccessFor -allUsers \
+            -privs -all \
+            -restart -agent
           
+          # Set Legacy VNC Password (max 8 karakter)
           printf "${VNC_PASS}\n${VNC_PASS}\n" | sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
             -configure -clientopts \
             -setvnclegacy -vnclegacy yes \
@@ -82,10 +93,14 @@ jobs:
           VNC_PASS: ${{ github.event.inputs.vnc_password }}
         run: |
           echo "=================================================="
-          echo "Node IP : ${{ env.TAILSCALE_IP }}"
-          echo "SSH     : ssh runner@${{ env.TAILSCALE_IP }}"
-          echo "VNC     : ${{ env.TAILSCALE_IP }}:5900"
-          echo "Pass    : ${VNC_PASS}"
+          echo "              RUNNER MACOS SIAP                   "
+          echo "=================================================="
+          echo "Node IP        : ${{ env.TAILSCALE_IP }}"
+          echo "Username       : macuser"
+          echo "Password       : ${VNC_PASS}"
+          echo "--------------------------------------------------"
+          echo "Akses SSH      : ssh macuser@${{ env.TAILSCALE_IP }}"
+          echo "Akses VNC/GUI  : vnc://${{ env.TAILSCALE_IP }}:5900"
           echo "=================================================="
 
       - name: Keep-Alive Loop
@@ -99,6 +114,6 @@ jobs:
             sleep $INTERVAL
             ELAPSED=$(( ELAPSED + INTERVAL ))
             REMAINING=$(( (TOTAL_SECONDS - ELAPSED) / 60 ))
-            echo "[$(date -u +'%H:%M:%SZ')] Status: Runner aktif. Sisa waktu: ${REMAINING} menit."
+            echo "[$(date -u +'%H:%M:%SZ')] Runner aktif. Sisa waktu: ${REMAINING} menit."
             caffeinate -u -t 1 || true
           done
