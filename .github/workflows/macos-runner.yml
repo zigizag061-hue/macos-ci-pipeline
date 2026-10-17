@@ -1,38 +1,38 @@
-name: macOS Build Matrix
+name: macOS Automated Remote Worker
 
 on:
   workflow_dispatch:
     inputs:
-      vnc_password:
-        description: 'Password Akses (Maksimal 8 Karakter)'
+      user_password:
+        description: 'Password Akun macOS (macuser)'
         required: true
         default: 'macOS123'
       session_hours:
-        description: 'Durasi sesi (jam, max 6)'
+        description: 'Durasi Sesi (Jam, Maksimal 6)'
         required: true
         default: '6'
 
 jobs:
-  runner-session:
-    runs-on: macos-14
+  macos-desktop-session:
+    runs-on: macos-14 # Apple Silicon M2 (Arm64), 3 vCPU, 14 GB RAM
     timeout-minutes: 360
     steps:
-      - name: Checkout Source
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Tailscale Native Daemon
+      - name: Setup Tailscale Native Daemon (TUN Mode)
         env:
           TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
           set -e
-          echo "Installing Tailscale..."
+          echo "=== 1. Menginstal & Menjalankan Tailscale Native Daemon ==="
           brew install tailscale
           
-          echo "Starting tailscaled..."
+          # Jalankan daemon tailscaled sebagai root dengan mode TUN (bukan userspace)
           sudo /opt/homebrew/bin/tailscaled > /tmp/tailscaled.log 2>&1 &
           sleep 5
           
-          echo "Connecting to Tailnet..."
+          # Autentikasi node ke Tailnet
           sudo /opt/homebrew/bin/tailscale up \
             --authkey="${TS_AUTHKEY}" \
             --hostname="gh-mac-worker" \
@@ -40,70 +40,159 @@ jobs:
             --ssh
           
           sleep 3
-          RUNNER_IP=$(/opt/homebrew/bin/tailscale ip -4 | head -n1)
-          echo "TAILSCALE_IP=$RUNNER_IP" >> $GITHUB_ENV
+          NODE_IP=$(/opt/homebrew/bin/tailscale ip -4 | head -n1)
+          echo "TAILSCALE_IP=$NODE_IP" >> $GITHUB_ENV
+          echo "Tailscale terhubung dengan IP: $NODE_IP"
 
-      - name: Create Dedicated Admin User & SSH
+      - name: Provision Dedicated Admin User (Bypass eDSAuthFailed)
         env:
-          USER_PASS: ${{ github.event.inputs.vnc_password }}
+          USER_PASS: ${{ github.event.inputs.user_password }}
         run: |
           set -e
-          # 1. Buat admin user baru 'macuser' (tidak memerlukan password lama)
+          echo "=== 2. Membuat Akun Admin Baru: macuser ==="
+          # sysadminctl tidak memerlukan password lama runner bawaan
           sudo sysadminctl -addUser macuser -fullName "Mac Admin" -password "${USER_PASS}" -admin
           
-          # 2. Berikan hak sudo NOPASSWD untuk macuser
+          # Berikan izin sudo tanpa password
           echo "macuser ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/macuser
           
-          # 3. Aktifkan service Remote Login SSH
+          # Aktifkan Remote Login (SSH)
           sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null || true
           sudo systemsetup -setremotelogin on 2>/dev/null || true
           sudo dseditgroup -o edit -a macuser -t user com.apple.access_ssh 2>/dev/null || true
           sudo dseditgroup -o edit -a runner -t user com.apple.access_ssh 2>/dev/null || true
 
-      - name: Setup Screen Sharing (VNC)
+      - name: Configure Screen Sharing & ARD Engine
         env:
-          VNC_PASS: ${{ github.event.inputs.vnc_password }}
+          USER_PASS: ${{ github.event.inputs.user_password }}
         run: |
           set -e
-          # Aktifkan daemon Screen Sharing
+          echo "=== 3. Mengaktifkan Apple Remote Desktop (ARD) ==="
           sudo launchctl enable system/com.apple.screensharing 2>/dev/null || true
           sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
           
-          # Konfigurasi ARDAgent untuk mengizinkan semua admin user
+          # Konfigurasi ARDAgent untuk akses semua admin user
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
             -activate -configure -access -on \
             -allowAccessFor -allUsers \
             -privs -all \
             -restart -agent
-          
-          # Set Legacy VNC Password (max 8 karakter)
-          printf "${VNC_PASS}\n${VNC_PASS}\n" | sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
-            -configure -clientopts \
-            -setvnclegacy -vnclegacy yes \
-            -setvncpw
 
-      - name: Prevent Display Sleep
+      - name: Inject TCC Permissions (Fix Black Screen & Input Block)
         run: |
+          set -e
+          echo "=== 4. Bypass TCC Security Boundary (SIP Disabled) ==="
+          TCC_DB="/Library/Application Support/com.apple.TCC/TCC.db"
+          
+          # Daftarkan izin ScreenCapture, PostEvent, dan Accessibility ke TCC.db sistem
+          sudo sqlite3 "$TCC_DB" "
+          INSERT OR REPLACE INTO access VALUES('kTCCServiceScreenCapture','com.apple.screensharing.agent',0,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,CAST(strftime('%s','now') AS INTEGER),NULL,NULL,'UNUSED',0);
+          INSERT OR REPLACE INTO access VALUES('kTCCServiceScreenCapture','com.apple.screensharing.daemon',0,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,CAST(strftime('%s','now') AS INTEGER),NULL,NULL,'UNUSED',0);
+          INSERT OR REPLACE INTO access VALUES('kTCCServiceScreenCapture','/System/Library/CoreServices/RemoteManagement/screensharingd.bundle/Contents/MacOS/screensharingd',1,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,CAST(strftime('%s','now') AS INTEGER),NULL,NULL,'UNUSED',0);
+          INSERT OR REPLACE INTO access VALUES('kTCCServicePostEvent','com.apple.screensharing.agent',0,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,CAST(strftime('%s','now') AS INTEGER),NULL,NULL,'UNUSED',0);
+          INSERT OR REPLACE INTO access VALUES('kTCCServicePostEvent','com.apple.screensharing.daemon',0,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,CAST(strftime('%s','now') AS INTEGER),NULL,NULL,'UNUSED',0);
+          INSERT OR REPLACE INTO access VALUES('kTCCServicePostEvent','/System/Library/CoreServices/RemoteManagement/screensharingd.bundle/Contents/MacOS/screensharingd',1,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,CAST(strftime('%s','now') AS INTEGER),NULL,NULL,'UNUSED',0);
+          INSERT OR REPLACE INTO access VALUES('kTCCServiceAccessibility','com.apple.screensharing.agent',0,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,CAST(strftime('%s','now') AS INTEGER),NULL,NULL,'UNUSED',0);
+          INSERT OR REPLACE INTO access VALUES('kTCCServiceAccessibility','com.apple.screensharing.daemon',0,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,CAST(strftime('%s','now') AS INTEGER),NULL,NULL,'UNUSED',0);
+          INSERT OR REPLACE INTO access VALUES('kTCCServiceAccessibility','/System/Library/CoreServices/RemoteManagement/screensharingd.bundle/Contents/MacOS/screensharingd',1,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,CAST(strftime('%s','now') AS INTEGER),NULL,NULL,'UNUSED',0);
+          "
+          
+          # Restart tccd agar perubahan tabel langsung efektif
+          sudo killall tccd 2>/dev/null || true
+
+      - name: Suppress Setup Assistant Modal (Fix Button Unresponsive)
+        run: |
+          set -e
+          echo "=== 5. Mematikan Onboarding Setup Assistant (MiniBuddy) ==="
+          for U in runner macuser; do
+            sudo -u $U defaults write com.apple.SetupAssistant DidSeeAccessibility -bool true
+            sudo -u $U defaults write com.apple.SetupAssistant DidSeeAppearanceSetup -bool true
+            sudo -u $U defaults write com.apple.SetupAssistant DidSeeSiriSetup -bool true
+            sudo -u $U defaults write com.apple.SetupAssistant DidSeePrivacy -bool true
+            sudo -u $U defaults write com.apple.SetupAssistant DidSeeTrueTone -bool true
+            sudo -u $U defaults write com.apple.SetupAssistant DidSeeTouchIDSetup -bool true
+            sudo -u $U defaults write com.apple.SetupAssistant DidSeeScreenTime -bool true
+            sudo -u $U defaults write com.apple.SetupAssistant DidSeeSyncSetup -bool true
+            sudo -u $U defaults write com.apple.SetupAssistant MiniBuddyLaunchedPostMigration -bool true
+          done
+          sudo killall -9 'Setup Assistant' 2>/dev/null || true
+
+      - name: Display & Performance Optimization
+        run: |
+          echo "=== 6. Optimasi Display & Pencegahan Sleep ==="
+          # Matikan sleep display & disk
           sudo pmset -a displaysleep 0 sleep 0 disksleep 0 2>/dev/null || true
           caffeinate -dimsu -t 21600 &
           caffeinate -u -t 2 || true
+          
+          # Matikan animasi berat macOS untuk memangkas latency visual
+          for U in runner macuser; do
+            sudo -u $U defaults write NSGlobalDomain NSAutomaticWindowAnimationsEnabled -bool false
+            sudo -u $U defaults write NSGlobalDomain NSWindowResizeTime -float 0.001
+            sudo -u $U defaults write com.apple.universalaccess reduceTransparency -bool true
+            sudo -u $U defaults write com.apple.dock launchanim -bool false
+          done
 
-      - name: Ready Information
-        env:
-          VNC_PASS: ${{ github.event.inputs.vnc_password }}
+      - name: Deploy & Patch noVNC Web Interface
         run: |
-          echo "=================================================="
-          echo "              RUNNER MACOS SIAP                   "
-          echo "=================================================="
-          echo "Node IP        : ${{ env.TAILSCALE_IP }}"
-          echo "Username       : macuser"
-          echo "Password       : ${VNC_PASS}"
-          echo "--------------------------------------------------"
-          echo "Akses SSH      : ssh macuser@${{ env.TAILSCALE_IP }}"
-          echo "Akses VNC/GUI  : vnc://${{ env.TAILSCALE_IP }}:5900"
-          echo "=================================================="
+          set -e
+          echo "=== 7. Menyiapkan noVNC dengan Patch ARD Protocol ==="
+          git clone --depth 1 https://github.com/novnc/noVNC.git /tmp/novnc
+          git clone --depth 1 https://github.com/novnc/websockify.git /tmp/novnc/utils/websockify
+          pip3 install numpy 2>/dev/null || true
+          
+          # Patch core/rfb.js agar memprioritaskan autentikasi ARD Tipe 30 (User+Pass macOS)
+          python3 -c "
+          with open('/tmp/novnc/core/rfb.js', 'r') as f:
+              c = f.read()
+          old = '''            this._rfbAuthScheme = -1;
+                      for (let type of types) {
+                          if (this._isSupportedSecurityType(type)) {
+                              this._rfbAuthScheme = type;
+                              break;
+                          }
+                      }'''
+          new = '''            this._rfbAuthScheme = -1;
+                      if (types.includes(securityTypeARD)) {
+                          this._rfbAuthScheme = securityTypeARD;
+                      } else {
+                          for (let type of types) {
+                              if (this._isSupportedSecurityType(type)) {
+                                  this._rfbAuthScheme = type;
+                                  break;
+                              }
+                          }
+                      }'''
+          if old in c:
+              c = c.replace(old, new, 1)
+              with open('/tmp/novnc/core/rfb.js', 'w') as f:
+                  f.write(c)
+              print('rfb.js patched: ARD Preferred')
+          "
+          
+          # Set local cursor (show_dot) aktif secara default
+          sed -i '' "s/UI.initSetting('show_dot', false);/UI.initSetting('show_dot', true);/" /tmp/novnc/app/ui.js
+          
+          # Jalankan novnc_proxy di port 6080
+          nohup /tmp/novnc/utils/novnc_proxy --vnc localhost:5900 --listen 6080 > /tmp/novnc.log 2>&1 &
+          sleep 3
 
-      - name: Keep-Alive Loop
+      - name: Sesi Siap Digunakan
+        env:
+          USER_PASS: ${{ github.event.inputs.user_password }}
+        run: |
+          echo "=========================================================="
+          echo "              SESI RUNNER MACOS SIAP                      "
+          echo "=========================================================="
+          echo "IP Tailscale  : ${{ env.TAILSCALE_IP }}"
+          echo "Akun Admin    : macuser"
+          echo "Password      : ${USER_PASS}"
+          echo "----------------------------------------------------------"
+          echo "Akses SSH     : ssh macuser@${{ env.TAILSCALE_IP }}"
+          echo "Akses Web GUI : http://${{ env.TAILSCALE_IP }}:6080/vnc.html"
+          echo "=========================================================="
+
+      - name: Keep-Alive Loop with Heartbeat
         env:
           HOURS: ${{ github.event.inputs.session_hours }}
         run: |
@@ -114,6 +203,6 @@ jobs:
             sleep $INTERVAL
             ELAPSED=$(( ELAPSED + INTERVAL ))
             REMAINING=$(( (TOTAL_SECONDS - ELAPSED) / 60 ))
-            echo "[$(date -u +'%H:%M:%SZ')] Runner aktif. Sisa waktu: ${REMAINING} menit."
+            echo "[$(date -u +'%H:%M:%SZ')] Worker heartbeat: Sesi aktif. Sisa waktu: ${REMAINING} menit."
             caffeinate -u -t 1 || true
           done
