@@ -1,0 +1,96 @@
+name: macOS Build Matrix
+
+on:
+  workflow_dispatch:
+    inputs:
+      vnc_password:
+        description: 'Password Akses (Maksimal 8 Karakter)'
+        required: true
+        default: 'macOS123'
+      session_hours:
+        description: 'Durasi sesi (jam, max 6)'
+        required: true
+        default: '6'
+
+jobs:
+  runner-session:
+    runs-on: macos-14
+    timeout-minutes: 360
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+
+      - name: Setup Tailscale Native Daemon
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          set -e
+          echo "Installing Tailscale..."
+          brew install tailscale
+          
+          echo "Starting tailscaled..."
+          sudo /opt/homebrew/bin/tailscaled > /tmp/tailscaled.log 2>&1 &
+          sleep 5
+          
+          echo "Connecting to Tailnet..."
+          sudo /opt/homebrew/bin/tailscale up \
+            --authkey="${TS_AUTHKEY}" \
+            --hostname="gh-mac-worker" \
+            --accept-routes \
+            --ssh
+          
+          sleep 3
+          RUNNER_IP=$(/opt/homebrew/bin/tailscale ip -4 | head -n1)
+          echo "TAILSCALE_IP=$RUNNER_IP" >> $GITHUB_ENV
+
+      - name: Setup System User & SSH
+        run: |
+          SYS_PASS=*** github.event.inputs.vnc_password }}"
+          echo "runner:${SYS_PASS}" | sudo chpasswd
+          sudo systemsetup -setremotelogin on || true
+          sudo dseditgroup -o edit -a runner -t user com.apple.access_ssh 2>/dev/null || true
+
+      - name: Setup Screen Sharing (VNC)
+        env:
+          VNC_PASS: ${{ github.event.inputs.vnc_password }}
+        run: |
+          set -e
+          sudo launchctl enable system/com.apple.screensharing 2>/dev/null || true
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
+          
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -activate -configure -access -on \
+            -restart -agent -privs -all
+          
+          printf "${VNC_PASS}\n${VNC_PASS}\n" | sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -configure -clientopts \
+            -setvnclegacy -vnclegacy yes \
+            -setvncpw
+
+      - name: Prevent Display Sleep
+        run: |
+          sudo pmset -a displaysleep 0 sleep 0 disksleep 0 2>/dev/null || true
+          caffeinate -dimsu -t 21600 &
+          caffeinate -u -t 2 || true
+
+      - name: Ready Information
+        run: |
+          echo "=================================================="
+          echo "Node IP : ${{ env.TAILSCALE_IP }}"
+          echo "SSH     : ssh runner@${{ env.TAILSCALE_IP }}"
+          echo "VNC     : ${{ env.TAILSCALE_IP }}:5900"
+          echo "Pass    : ${{ github.event.inputs.vnc_password }}"
+          echo "=================================================="
+
+      - name: Keep-Alive Loop
+        run: |
+          TOTAL_SECONDS=$(( ${{ github.event.inputs.session_hours }} * 3600 ))
+          ELAPSED=0
+          INTERVAL=180
+          while [ $ELAPSED -lt $TOTAL_SECONDS ]; do
+            sleep $INTERVAL
+            ELAPSED=$(( ELAPSED + INTERVAL ))
+            REMAINING=$(( (TOTAL_SECONDS - ELAPSED) / 60 ))
+            echo "[$(date -u +'%H:%M:%SZ')] Status: Runner aktif. Sisa waktu: ${REMAINING} menit."
+            caffeinate -u -t 1 || true
+          done
