@@ -47,7 +47,10 @@ jobs:
         env:
           USER_PASS: ${{ github.event.inputs.vnc_password }}
         run: |
-          echo "runner:${USER_PASS}" | sudo chpasswd
+          # Set password akun user macOS via Directory Service (dscl)
+          sudo dscl . -passwd /Users/runner "${USER_PASS}"
+          
+          # Aktifkan layanan Remote Login (SSH)
           sudo systemsetup -setremotelogin on || true
           sudo dseditgroup -o edit -a runner -t user com.apple.access_ssh 2>/dev/null || true
 
