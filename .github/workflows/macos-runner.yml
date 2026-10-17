@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       user_password:
-        description: 'Password Akun macOS (macuser)'
+        description: 'Password Akun macOS & RustDesk (macuser)'
         required: true
         default: 'macOS123'
       session_hours:
@@ -95,6 +95,11 @@ jobs:
           INSERT OR REPLACE INTO access VALUES('kTCCServiceAccessibility','com.apple.screensharing.agent',0,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,CAST(strftime('%s','now') AS INTEGER),NULL,NULL,'UNUSED',0);
           INSERT OR REPLACE INTO access VALUES('kTCCServiceAccessibility','com.apple.screensharing.daemon',0,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,CAST(strftime('%s','now') AS INTEGER),NULL,NULL,'UNUSED',0);
           INSERT OR REPLACE INTO access VALUES('kTCCServiceAccessibility','/System/Library/CoreServices/RemoteManagement/screensharingd.bundle/Contents/MacOS/screensharingd',1,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,CAST(strftime('%s','now') AS INTEGER),NULL,NULL,'UNUSED',0);
+          
+          INSERT OR REPLACE INTO access VALUES('kTCCServiceScreenCapture','com.carriez.rustdesk',0,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,CAST(strftime('%s','now') AS INTEGER),NULL,NULL,'UNUSED',0);
+          INSERT OR REPLACE INTO access VALUES('kTCCServiceAccessibility','com.carriez.rustdesk',0,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,CAST(strftime('%s','now') AS INTEGER),NULL,NULL,'UNUSED',0);
+          INSERT OR REPLACE INTO access VALUES('kTCCServiceListenEvent','com.carriez.rustdesk',0,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,CAST(strftime('%s','now') AS INTEGER),NULL,NULL,'UNUSED',0);
+          INSERT OR REPLACE INTO access VALUES('kTCCServicePostEvent','com.carriez.rustdesk',0,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,CAST(strftime('%s','now') AS INTEGER),NULL,NULL,'UNUSED',0);
           "
           
           # Restart tccd agar perubahan tabel langsung efektif
@@ -133,10 +138,10 @@ jobs:
             sudo -u $U defaults write com.apple.dock launchanim -bool false
           done
 
-      - name: Deploy & Patch noVNC Web Interface
+      - name: Deploy & Patch noVNC Web Interface (Fallback)
         run: |
           set -e
-          echo "=== 7. Menyiapkan noVNC dengan Patch ARD Protocol ==="
+          echo "=== 7. Menyiapkan noVNC Fallback ==="
           git clone --depth 1 https://github.com/novnc/noVNC.git /tmp/novnc
           git clone --depth 1 https://github.com/novnc/websockify.git /tmp/novnc/utils/websockify
           pip3 install numpy 2>/dev/null || true
@@ -177,6 +182,40 @@ jobs:
           nohup /tmp/novnc/utils/novnc_proxy --vnc localhost:5900 --listen 6080 > /tmp/novnc.log 2>&1 &
           sleep 3
 
+      - name: Deploy & Configure RustDesk (High-FPS Video Streaming)
+        env:
+          USER_PASS: ${{ github.event.inputs.user_password }}
+        run: |
+          set -e
+          echo "=== 8. Mengunduh dan Memasang RustDesk (Apple Silicon Arm64) ==="
+          LATEST_URL=$(curl -sL https://api.github.com/repos/rustdesk/rustdesk/releases/latest | grep "browser_download_url.*aarch64\.dmg" | cut -d '"' -f 4 | head -n1)
+          if [ -z "$LATEST_URL" ]; then
+            LATEST_URL="https://github.com/rustdesk/rustdesk/releases/download/1.5.0/rustdesk-1.5.0-aarch64.dmg"
+          fi
+          echo "Downloading: $LATEST_URL"
+          curl -L -o /tmp/rustdesk.dmg "$LATEST_URL"
+          
+          # Mount dan pasang RustDesk.app ke /Applications
+          hdiutil attach /tmp/rustdesk.dmg -mountpoint /Volumes/RustDesk -nobrowse -quiet
+          sudo cp -R /Volumes/RustDesk/RustDesk.app /Applications/
+          hdiutil detach /Volumes/RustDesk -quiet
+          rm -f /tmp/rustdesk.dmg
+          
+          # Hapus karantina Gatekeeper
+          sudo xattr -rd com.apple.quarantine /Applications/RustDesk.app 2>/dev/null || true
+          
+          echo "=== Mengonfigurasi Password & Menjalankan RustDesk ==="
+          # Set password permanen RustDesk
+          sudo /Applications/RustDesk.app/Contents/MacOS/RustDesk --password "${USER_PASS}"
+          
+          # Buka aplikasi di sesi grafis console macuser
+          sudo -u macuser open -a /Applications/RustDesk.app
+          sleep 4
+          
+          # Ambil RustDesk ID
+          RD_ID=$(/Applications/RustDesk.app/Contents/MacOS/RustDesk --get-id 2>/dev/null || echo "DIRECT_IP_ONLY")
+          echo "RUSTDESK_ID=$RD_ID" >> $GITHUB_ENV
+
       - name: Sesi Siap Digunakan
         env:
           USER_PASS: ${{ github.event.inputs.user_password }}
@@ -184,12 +223,16 @@ jobs:
           echo "=========================================================="
           echo "              SESI RUNNER MACOS SIAP                      "
           echo "=========================================================="
-          echo "IP Tailscale  : ${{ env.TAILSCALE_IP }}"
-          echo "Akun Admin    : macuser"
-          echo "Password      : ${USER_PASS}"
+          echo "IP Tailscale      : ${{ env.TAILSCALE_IP }}"
+          echo "Akun Admin macOS  : macuser"
+          echo "Password Akun     : ${USER_PASS}"
           echo "----------------------------------------------------------"
-          echo "Akses SSH     : ssh macuser@${{ env.TAILSCALE_IP }}"
-          echo "Akses Web GUI : http://${{ env.TAILSCALE_IP }}:6080/vnc.html"
+          echo "1. RustDesk GUI   : Direct IP : ${{ env.TAILSCALE_IP }}"
+          echo "                    ID Publik : ${{ env.RUSTDESK_ID }}"
+          echo "                    Password  : ${USER_PASS}"
+          echo "----------------------------------------------------------"
+          echo "2. VS Code (SSH)  : Host: mac-runner (0ms Lag)"
+          echo "3. Web GUI noVNC  : http://${{ env.TAILSCALE_IP }}:6080/vnc.html"
           echo "=========================================================="
 
       - name: Keep-Alive Loop with Heartbeat
