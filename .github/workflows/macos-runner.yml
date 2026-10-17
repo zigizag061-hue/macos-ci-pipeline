@@ -44,9 +44,10 @@ jobs:
           echo "TAILSCALE_IP=$RUNNER_IP" >> $GITHUB_ENV
 
       - name: Setup System User & SSH
+        env:
+          USER_PASS: ${{ github.event.inputs.vnc_password }}
         run: |
-          SYS_PASS=*** github.event.inputs.vnc_password }}"
-          echo "runner:${SYS_PASS}" | sudo chpasswd
+          echo "runner:${USER_PASS}" | sudo chpasswd
           sudo systemsetup -setremotelogin on || true
           sudo dseditgroup -o edit -a runner -t user com.apple.access_ssh 2>/dev/null || true
 
@@ -74,17 +75,21 @@ jobs:
           caffeinate -u -t 2 || true
 
       - name: Ready Information
+        env:
+          VNC_PASS: ${{ github.event.inputs.vnc_password }}
         run: |
           echo "=================================================="
           echo "Node IP : ${{ env.TAILSCALE_IP }}"
           echo "SSH     : ssh runner@${{ env.TAILSCALE_IP }}"
           echo "VNC     : ${{ env.TAILSCALE_IP }}:5900"
-          echo "Pass    : ${{ github.event.inputs.vnc_password }}"
+          echo "Pass    : ${VNC_PASS}"
           echo "=================================================="
 
       - name: Keep-Alive Loop
+        env:
+          HOURS: ${{ github.event.inputs.session_hours }}
         run: |
-          TOTAL_SECONDS=$(( ${{ github.event.inputs.session_hours }} * 3600 ))
+          TOTAL_SECONDS=$(( HOURS * 3600 ))
           ELAPSED=0
           INTERVAL=180
           while [ $ELAPSED -lt $TOTAL_SECONDS ]; do
