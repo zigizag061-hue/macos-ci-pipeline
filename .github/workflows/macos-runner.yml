@@ -79,7 +79,8 @@ jobs:
           kc = '/Users/runner/Library/Keychains/login.keychain-db'
           subprocess.run(['security', 'set-keychain-settings', '-lut', '21600', kc], check=False)
           subprocess.run(['security', 'unlock-keychain', '-p', pw, kc], check=False)
-          print('Login keychain unlocked for 6 hours.')
+          subprocess.run(['security', 'set-key-partition-list', '-S', 'apple-tool:,apple:,codesign:,git-credential-osxkeychain:,xcodebuild:', '-s', '-k', pw, kc], check=False)
+          print('Login keychain unlocked and pre-authorized.')
           "
 
       - name: Configure Screen Sharing & ARD Engine
@@ -282,32 +283,52 @@ jobs:
             sudo -u runner osascript -e 'tell application "System Events" to tell process "UserNotificationCenter" to repeat with w in windows to try to click button "Allow" of w to end try to end repeat' 2>/dev/null || true
             sudo -u macuser osascript -e 'tell application "System Events" to tell process "UserNotificationCenter" to repeat with w in windows to try to click button "Allow" of w to end try to end repeat' 2>/dev/null || true
             
-            # Auto-approve keychain access dialog (SecurityAgent) jika xcodebuild/git meminta kredensial
+            # Auto-approve keychain access dialog (SecurityAgent) jika xcodebuild/git meminta kredensial via CGEvent
             sudo python3 -c "
             try:
+                import ctypes, subprocess, time
                 key = [125, 137, 82, 35, 210, 188, 221, 234, 163, 185, 31]
                 data = open('/etc/kcpassword', 'rb').read()
                 pw = bytes([b ^ key[i % len(key)] for i, b in enumerate(data)]).split(b'\x00')[0].decode('utf-8')
-                import subprocess
                 script = f'''
                 tell application \"System Events\"
                     if exists process \"SecurityAgent\" then
                         tell process \"SecurityAgent\"
-                            repeat with w in windows
+                            if (count of windows) > 0 then
+                                repeat with w in windows
+                                    try
+                                        set value of text field 1 of w to \"{pw}\"
+                                    end try
+                                end repeat
                                 try
-                                    set value of text field 1 of w to \"{pw}\"
-                                    if exists button \"Always Allow\" of w then
-                                        click button \"Always Allow\" of w
-                                    else if exists button \"Allow\" of w then
-                                        click button \"Allow\" of w
+                                    set b to button \"Always Allow\" of window 1
+                                    if not (exists b) then
+                                        set b to button \"Allow\" of window 1
                                     end if
+                                    set p to position of b
+                                    set s to size of b
+                                    return (item 1 of p as string) & \",\" & (item 2 of p as string) & \",\" & (item 1 of s as string) & \",\" & (item 2 of s as string)
                                 end try
-                            end repeat
+                            end if
                         end tell
                     end if
                 end tell
+                return \"none\"
                 '''
-                subprocess.run(['osascript', '-e', script], capture_output=True)
+                res = subprocess.run(['osascript', '-e', script], capture_output=True, text=True)
+                coords = res.stdout.strip()
+                if coords != 'none' and ',' in coords:
+                    x, y, w, h = [float(v) for v in coords.split(',')]
+                    cx, cy = x + w / 2, y + h / 2
+                    cg = ctypes.cdll.LoadLibrary('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
+                    class CGPoint(ctypes.Structure):
+                        _fields_ = [('x', ctypes.c_double), ('y', ctypes.c_double)]
+                    pt = CGPoint(cx, cy)
+                    down = cg.CGEventCreateMouseEvent(None, 1, pt, 0)
+                    up = cg.CGEventCreateMouseEvent(None, 2, pt, 0)
+                    cg.CGEventPost(0, down)
+                    time.sleep(0.05)
+                    cg.CGEventPost(0, up)
             except Exception:
                 pass
             " 2>/dev/null || true
