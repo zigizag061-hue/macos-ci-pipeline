@@ -14,11 +14,16 @@ on:
 
 jobs:
   macos-desktop-session:
-    runs-on: macos-14 # Apple Silicon M2 (Arm64), 3 vCPU, 14 GB RAM
+    runs-on: macos-15 # macOS 15 Sequoia (Apple Silicon Arm64), 3 vCPU, 7 GB RAM
     timeout-minutes: 360
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+
+      - name: Mask Sensitive Input
+        run: |
+          # Sensor password agar tidak pernah muncul di log publik GitHub Actions
+          echo "::add-mask::${{ github.event.inputs.user_password }}"
 
       - name: Setup Tailscale Native Daemon (TUN Mode)
         env:
@@ -204,32 +209,34 @@ jobs:
           # Hapus karantina Gatekeeper
           sudo xattr -rd com.apple.quarantine /Applications/RustDesk.app 2>/dev/null || true
           
-          echo "=== Mengonfigurasi Password & Menjalankan RustDesk ==="
-          # Set password permanen RustDesk
-          sudo /Applications/RustDesk.app/Contents/MacOS/RustDesk --password "${USER_PASS}"
+          echo "=== Mengonfigurasi Direct IP & Menjalankan RustDesk ==="
+          # Aktifkan Direct IP & Whitelist Tailscale di konfigurasi RustDesk TOML
+          for U in runner macuser; do
+            PREF_DIR="/Users/$U/Library/Preferences/com.carriez.RustDesk"
+            sudo -u $U mkdir -p "$PREF_DIR"
+            python3 -c "import os; p='$PREF_DIR/RustDesk2.toml'; t=open(p).read() if os.path.exists(p) else ''; t=t.replace('[options]', '[options]\ndirect-server = \'Y\'\ndirect-access-port = \'21118\'\nwhitelist = \'100.64.0.0/10\'') if '[options]' in t else t+'\n[options]\ndirect-server = \'Y\'\ndirect-access-port = \'21118\'\nwhitelist = \'100.64.0.0/10\'\n'; open(p,'w').write(t)" 2>/dev/null || true
+            sudo chown -R $U:staff "$PREF_DIR" 2>/dev/null || true
+          done
           
-          # Buka aplikasi di sesi grafis console macuser
+          # Buka aplikasi RustDesk terlebih dahulu agar IPC daemon aktif
           sudo -u macuser open -a /Applications/RustDesk.app
           sleep 4
           
-          # Ambil RustDesk ID
-          RD_ID=$(/Applications/RustDesk.app/Contents/MacOS/RustDesk --get-id 2>/dev/null || echo "DIRECT_IP_ONLY")
-          echo "RUSTDESK_ID=$RD_ID" >> $GITHUB_ENV
+          echo "=== Mengonfigurasi Password Permanen RustDesk ==="
+          # Set password permanen via IPC setelah RustDesk berjalan
+          sudo /Applications/RustDesk.app/Contents/MacOS/RustDesk --password "${USER_PASS}"
 
       - name: Sesi Siap Digunakan
-        env:
-          USER_PASS: ${{ github.event.inputs.user_password }}
         run: |
           echo "=========================================================="
           echo "              SESI RUNNER MACOS SIAP                      "
           echo "=========================================================="
           echo "IP Tailscale      : ${{ env.TAILSCALE_IP }}"
           echo "Akun Admin macOS  : macuser"
-          echo "Password Akun     : ${USER_PASS}"
+          echo "Status Keamanan   : Tailnet Private Mesh Only (IP 100.x.y.z)"
           echo "----------------------------------------------------------"
-          echo "1. RustDesk GUI   : Direct IP : ${{ env.TAILSCALE_IP }}"
-          echo "                    ID Publik : ${{ env.RUSTDESK_ID }}"
-          echo "                    Password  : ${USER_PASS}"
+          echo "1. RustDesk GUI   : Masukkan Direct IP -> ${{ env.TAILSCALE_IP }}"
+          echo "                    (Gunakan password yang Anda input saat trigger)"
           echo "----------------------------------------------------------"
           echo "2. VS Code (SSH)  : Host: mac-runner (0ms Lag)"
           echo "3. Web GUI noVNC  : http://${{ env.TAILSCALE_IP }}:6080/vnc.html"
