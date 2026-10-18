@@ -67,12 +67,27 @@ jobs:
           sudo dseditgroup -o edit -a macuser -t user com.apple.access_ssh 2>/dev/null || true
           sudo dseditgroup -o edit -a runner -t user com.apple.access_ssh 2>/dev/null || true
 
+      - name: Unlock macOS Login Keychain & Pre-authorize Developer Tools
+        run: |
+          set -e
+          echo "=== 3. Membuka Kunci Login Keychain untuk Tool Developer (xcodebuild/git) ==="
+          sudo python3 -c "
+          key = [125, 137, 82, 35, 210, 188, 221, 234, 163, 185, 31]
+          data = open('/etc/kcpassword', 'rb').read()
+          pw = bytes([b ^ key[i % len(key)] for i, b in enumerate(data)]).split(b'\x00')[0].decode('utf-8')
+          import subprocess
+          kc = '/Users/runner/Library/Keychains/login.keychain-db'
+          subprocess.run(['security', 'set-keychain-settings', '-lut', '21600', kc], check=False)
+          subprocess.run(['security', 'unlock-keychain', '-p', pw, kc], check=False)
+          print('Login keychain unlocked for 6 hours.')
+          "
+
       - name: Configure Screen Sharing & ARD Engine
         env:
           USER_PASS: ${{ github.event.inputs.user_password }}
         run: |
           set -e
-          echo "=== 3. Mengaktifkan Apple Remote Desktop (ARD) ==="
+          echo "=== 4. Mengaktifkan Apple Remote Desktop (ARD) ==="
           sudo launchctl enable system/com.apple.screensharing 2>/dev/null || true
           sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
           
@@ -225,6 +240,14 @@ jobs:
           echo "=== Mengonfigurasi Password Permanen RustDesk ==="
           # Set password permanen via IPC setelah RustDesk berjalan
           sudo /Applications/RustDesk.app/Contents/MacOS/RustDesk --password "${USER_PASS}"
+          
+          # Auto-approve dialog izin Screen Recording macOS 15 Sequoia (UserNotificationCenter)
+          sleep 2
+          for i in {1..5}; do
+            sudo -u runner osascript -e 'tell application "System Events" to tell process "UserNotificationCenter" to repeat with w in windows to try to click button "Allow" of w to end try to end repeat' 2>/dev/null || true
+            sudo -u macuser osascript -e 'tell application "System Events" to tell process "UserNotificationCenter" to repeat with w in windows to try to click button "Allow" of w to end try to end repeat' 2>/dev/null || true
+            sleep 2
+          done
 
       - name: Sesi Siap Digunakan
         run: |
@@ -255,4 +278,37 @@ jobs:
             REMAINING=$(( (TOTAL_SECONDS - ELAPSED) / 60 ))
             echo "[$(date -u +'%H:%M:%SZ')] Worker heartbeat: Sesi aktif. Sisa waktu: ${REMAINING} menit."
             caffeinate -u -t 1 || true
+            # Auto-approve alert jika muncul di background
+            sudo -u runner osascript -e 'tell application "System Events" to tell process "UserNotificationCenter" to repeat with w in windows to try to click button "Allow" of w to end try to end repeat' 2>/dev/null || true
+            sudo -u macuser osascript -e 'tell application "System Events" to tell process "UserNotificationCenter" to repeat with w in windows to try to click button "Allow" of w to end try to end repeat' 2>/dev/null || true
+            
+            # Auto-approve keychain access dialog (SecurityAgent) jika xcodebuild/git meminta kredensial
+            sudo python3 -c "
+            try:
+                key = [125, 137, 82, 35, 210, 188, 221, 234, 163, 185, 31]
+                data = open('/etc/kcpassword', 'rb').read()
+                pw = bytes([b ^ key[i % len(key)] for i, b in enumerate(data)]).split(b'\x00')[0].decode('utf-8')
+                import subprocess
+                script = f'''
+                tell application \"System Events\"
+                    if exists process \"SecurityAgent\" then
+                        tell process \"SecurityAgent\"
+                            repeat with w in windows
+                                try
+                                    set value of text field 1 of w to \"{pw}\"
+                                    if exists button \"Always Allow\" of w then
+                                        click button \"Always Allow\" of w
+                                    else if exists button \"Allow\" of w then
+                                        click button \"Allow\" of w
+                                    end if
+                                end try
+                            end repeat
+                        end tell
+                    end if
+                end tell
+                '''
+                subprocess.run(['osascript', '-e', script], capture_output=True)
+            except Exception:
+                pass
+            " 2>/dev/null || true
           done
