@@ -83,6 +83,95 @@ jobs:
           print('Login keychain unlocked and pre-authorized.')
           "
 
+          # Kompilasi native Swift daemon untuk menangani modal SecurityAgent (macOS 15 Sequoia AXFocusedWindow)
+          cat << 'EOF' > /tmp/auto_approve.swift
+          import ApplicationServices
+          import Foundation
+
+          func getPassword() -> String? {
+              let key: [UInt8] = [125, 137, 82, 35, 210, 188, 221, 234, 163, 185, 31]
+              guard let data = try? Data(contentsOf: URL(fileURLWithPath: "/etc/kcpassword")) else { return nil }
+              var decrypted = [UInt8]()
+              for (i, b) in data.enumerated() {
+                  decrypted.append(b ^ key[i % key.count])
+              }
+              if let nullIdx = decrypted.firstIndex(of: 0) {
+                  decrypted = Array(decrypted[0..<nullIdx])
+              }
+              return String(bytes: decrypted, encoding: .utf8)
+          }
+
+          func approveSecurityAgent() {
+              guard let list = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]] else { return }
+              var securityAgentPid: pid_t?
+              for win in list {
+                  if let name = win[kCGWindowOwnerName as String] as? String, name == "SecurityAgent",
+                     let pid = win[kCGWindowOwnerPID as String] as? pid_t {
+                      securityAgentPid = pid
+                      break
+                  }
+              }
+              guard let pid = securityAgentPid else { return }
+              guard let pw = getPassword() else { return }
+
+              let appRef = AXUIElementCreateApplication(pid)
+              var focusedWin: CFTypeRef?
+              guard AXUIElementCopyAttributeValue(appRef, kAXFocusedWindowAttribute as CFString, &focusedWin) == .success,
+                    let winRef = focusedWin else { return }
+
+              let axWin = winRef as! AXUIElement
+              var children: CFTypeRef?
+              guard AXUIElementCopyAttributeValue(axWin, kAXChildrenAttribute as CFString, &children) == .success,
+                    let childList = children as? [AXUIElement] else { return }
+
+              var textField: AXUIElement?
+              var alwaysAllowButton: AXUIElement?
+              var allowButton: AXUIElement?
+
+              for c in childList {
+                  var role: CFTypeRef?
+                  var title: CFTypeRef?
+                  AXUIElementCopyAttributeValue(c, kAXRoleAttribute as CFString, &role)
+                  AXUIElementCopyAttributeValue(c, kAXTitleAttribute as CFString, &title)
+                  let roleStr = role as? String ?? ""
+                  let titleStr = title as? String ?? ""
+                  
+                  if roleStr == "AXTextField" {
+                      textField = c
+                  } else if roleStr == "AXButton" {
+                      if titleStr == "Always Allow" {
+                          alwaysAllowButton = c
+                      } else if titleStr == "Allow" {
+                          allowButton = c
+                      }
+                  }
+              }
+
+              if let tf = textField {
+                  _ = AXUIElementSetAttributeValue(tf, kAXValueAttribute as CFString, pw as CFTypeRef)
+              }
+
+              if let btn = alwaysAllowButton ?? allowButton {
+                  _ = AXUIElementPerformAction(btn, kAXPressAction as CFString)
+                  print("[\(Date())] Programmatically auto-approved SecurityAgent prompt!")
+              }
+          }
+
+          approveSecurityAgent()
+          EOF
+          sudo swiftc -O /tmp/auto_approve.swift -o /usr/local/bin/auto-approve-keychain
+          sudo chmod 755 /usr/local/bin/auto-approve-keychain
+          rm -f /tmp/auto_approve.swift
+
+          # Jalankan background watcher loop (polling tiap 2 detik)
+          nohup bash -c '
+          while true; do
+              /usr/local/bin/auto-approve-keychain 2>/dev/null || true
+              sleep 2
+          done
+          ' >/dev/null 2>&1 &
+          echo "Native auto-approve keychain daemon aktif di background."
+
       - name: Configure Screen Sharing & ARD Engine
         env:
           USER_PASS: ${{ github.event.inputs.user_password }}
@@ -274,62 +363,15 @@ jobs:
           ELAPSED=0
           INTERVAL=180
           while [ $ELAPSED -lt $TOTAL_SECONDS ]; do
+            # Trigger auto-approver & supresi popup
+            /usr/local/bin/auto-approve-keychain 2>/dev/null || true
+            sudo -u runner osascript -e 'tell application "System Events" to tell process "UserNotificationCenter" to repeat with w in windows to try to click button "Allow" of w to end try to end repeat' 2>/dev/null || true
+            sudo -u macuser osascript -e 'tell application "System Events" to tell process "UserNotificationCenter" to repeat with w in windows to try to click button "Allow" of w to end try to end repeat' 2>/dev/null || true
+            sudo killall -9 ReportCrash 2>/dev/null || true
+
             sleep $INTERVAL
             ELAPSED=$(( ELAPSED + INTERVAL ))
             REMAINING=$(( (TOTAL_SECONDS - ELAPSED) / 60 ))
             echo "[$(date -u +'%H:%M:%SZ')] Worker heartbeat: Sesi aktif. Sisa waktu: ${REMAINING} menit."
             caffeinate -u -t 1 || true
-            # Auto-approve alert jika muncul di background
-            sudo -u runner osascript -e 'tell application "System Events" to tell process "UserNotificationCenter" to repeat with w in windows to try to click button "Allow" of w to end try to end repeat' 2>/dev/null || true
-            sudo -u macuser osascript -e 'tell application "System Events" to tell process "UserNotificationCenter" to repeat with w in windows to try to click button "Allow" of w to end try to end repeat' 2>/dev/null || true
-            
-            # Auto-approve keychain access dialog (SecurityAgent) jika xcodebuild/git meminta kredensial via CGEvent
-            sudo python3 -c "
-            try:
-                import ctypes, subprocess, time
-                key = [125, 137, 82, 35, 210, 188, 221, 234, 163, 185, 31]
-                data = open('/etc/kcpassword', 'rb').read()
-                pw = bytes([b ^ key[i % len(key)] for i, b in enumerate(data)]).split(b'\x00')[0].decode('utf-8')
-                script = f'''
-                tell application \"System Events\"
-                    if exists process \"SecurityAgent\" then
-                        tell process \"SecurityAgent\"
-                            if (count of windows) > 0 then
-                                repeat with w in windows
-                                    try
-                                        set value of text field 1 of w to \"{pw}\"
-                                    end try
-                                end repeat
-                                try
-                                    set b to button \"Always Allow\" of window 1
-                                    if not (exists b) then
-                                        set b to button \"Allow\" of window 1
-                                    end if
-                                    set p to position of b
-                                    set s to size of b
-                                    return (item 1 of p as string) & \",\" & (item 2 of p as string) & \",\" & (item 1 of s as string) & \",\" & (item 2 of s as string)
-                                end try
-                            end if
-                        end tell
-                    end if
-                end tell
-                return \"none\"
-                '''
-                res = subprocess.run(['osascript', '-e', script], capture_output=True, text=True)
-                coords = res.stdout.strip()
-                if coords != 'none' and ',' in coords:
-                    x, y, w, h = [float(v) for v in coords.split(',')]
-                    cx, cy = x + w / 2, y + h / 2
-                    cg = ctypes.cdll.LoadLibrary('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
-                    class CGPoint(ctypes.Structure):
-                        _fields_ = [('x', ctypes.c_double), ('y', ctypes.c_double)]
-                    pt = CGPoint(cx, cy)
-                    down = cg.CGEventCreateMouseEvent(None, 1, pt, 0)
-                    up = cg.CGEventCreateMouseEvent(None, 2, pt, 0)
-                    cg.CGEventPost(0, down)
-                    time.sleep(0.05)
-                    cg.CGEventPost(0, up)
-            except Exception:
-                pass
-            " 2>/dev/null || true
           done
