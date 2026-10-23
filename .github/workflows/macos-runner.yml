@@ -172,6 +172,19 @@ jobs:
           ' >/dev/null 2>&1 &
           echo "Native auto-approve keychain daemon aktif di background."
 
+      - name: Initialize CoreSimulator & Xcode Build Environment
+        run: |
+          set -e
+          echo "=== 3b. Warm-up CoreSimulatorService & Disable Xcode Script Sandbox ==="
+          # Matikan package & script sandboxing global Xcode agar nested package SPM tidak terblokir
+          defaults write com.apple.dt.Xcode IDEDisablePackageSandbox -bool YES 2>/dev/null || true
+          defaults write com.apple.dt.Xcode DVTDisablePromptForPackageSandbox -bool YES 2>/dev/null || true
+          
+          # Inisialisasi dan refresh CoreSimulatorService di level user session
+          launchctl kickstart -k user/$(id -u)/com.apple.CoreSimulator.CoreSimulatorService 2>/dev/null || true
+          xcrun simctl list runtimes >/dev/null 2>&1 || true
+          echo "CoreSimulatorService warmed up and ready."
+
       - name: Configure Screen Sharing & ARD Engine
         env:
           USER_PASS: ${{ github.event.inputs.user_password }}
